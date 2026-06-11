@@ -1,0 +1,193 @@
+name: Publish microtool (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_id:
+        description: Kebab-case identifier (e.g. pdf-schedule-sync)
+        required: true
+        type: string
+      app_name:
+        description: Display name and zip filename prefix (e.g. PDF Schedule Sync)
+        required: true
+        type: string
+      description:
+        required: true
+        type: string
+      executable_path:
+        description: Relative path to the exe at the zip root (e.g. MyApp.exe)
+        required: true
+        type: string
+      owner:
+        required: true
+        type: string
+      spec_file:
+        description: Path to the PyInstaller .spec file (e.g. my_app.spec)
+        required: true
+        type: string
+      user_guide:
+        description: Optional path to a file to copy into dist/ before zipping
+        required: false
+        type: string
+        default: ''
+      arguments:
+        required: false
+        type: string
+        default: ''
+      python_version:
+        required: false
+        type: string
+        default: '3.12'
+      help_teams_uri:
+        required: false
+        type: string
+        default: 'https://teams.microsoft.com/'
+      support_email:
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version from tag
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag -notmatch '^v\d+\.\d+\.\d+') { $tag = "v0.0.0-${{ github.run_number }}" }
+          $version = $tag.TrimStart('v')
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: python -m PyInstaller --clean --noconfirm "${{ inputs.spec_file }}"
+
+      - name: Copy user guide into dist
+        if: inputs.user_guide != ''
+        shell: pwsh
+        run: |
+          $src  = "${{ inputs.user_guide }}"
+          $dest = "dist\$(Split-Path $src -Leaf)"
+          Copy-Item $src $dest -Force
+
+      - name: Package dist as zip
+        shell: pwsh
+        run: |
+          $zipName = "${{ inputs.app_name }}.zip"
+          if (Test-Path $zipName) { Remove-Item $zipName -Force }
+          Compress-Archive -Path "dist\*" -DestinationPath $zipName -Force
+          "ARTIFACT_PATH=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ARTIFACT_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Verify zip contents
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip     = [System.IO.Compression.ZipFile]::OpenRead($env:ARTIFACT_PATH)
+          $entries = $zip.Entries | Select-Object -ExpandProperty FullName
+          $zip.Dispose()
+          Write-Host "Zip contents:"
+          $entries | ForEach-Object { Write-Host "  $_" }
+          $expected = "${{ inputs.executable_path }}"
+          if ($entries -notcontains $expected) {
+            Write-Error "Expected '$expected' not found in zip. Actual entries: $($entries -join ', ')"
+            exit 1
+          }
+          Write-Host "OK: '$expected' is present in zip."
+
+      - name: Compute SHA256
+        id: hash
+        shell: pwsh
+        run: |
+          $sha = (Get-FileHash -Path $env:ARTIFACT_PATH -Algorithm SHA256).Hash.ToLower()
+          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_DEVOPS_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_DEVOPS_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_DEVOPS_DEV1_SUBSCRIPTION_ID }}
+
+      - name: Upload artifact to blob
+        shell: pwsh
+        run: |
+          $version  = "${{ steps.ver.outputs.version }}"
+          $appId    = "${{ inputs.app_id }}"
+          $blobName = "packages/$appId/versions/$version/$env:ARTIFACT_NAME"
+
+          az storage blob upload `
+            --account-name   "${{ vars.AZURE_STORAGE_ACCOUNT }}" `
+            --container-name "${{ vars.AZURE_STORAGE_CONTAINER }}" `
+            --name           $blobName `
+            --file           $env:ARTIFACT_PATH `
+            --auth-mode      login `
+            --overwrite `
+            --output         none
+
+          "ARTIFACT_BLOB_PATH=$blobName" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build and upload manifest
+        shell: pwsh
+        run: |
+          $version    = "${{ steps.ver.outputs.version }}"
+          $sha        = "${{ steps.hash.outputs.sha }}"
+          $appId      = "${{ inputs.app_id }}"
+          $base       = "https://${{ vars.AZURE_STORAGE_ACCOUNT }}.blob.core.windows.net/${{ vars.AZURE_STORAGE_CONTAINER }}"
+          $rawSas     = "${{ secrets.AZURE_STORAGE_READ_SAS }}"
+          if ($rawSas -match '[?](.+)$') { $rawSas = $Matches[1] }
+          $packageUri = "$base/$env:ARTIFACT_BLOB_PATH`?$rawSas"
+
+          $manifest = [ordered]@{
+            id             = $appId
+            name           = "${{ inputs.app_name }}"
+            description    = "${{ inputs.description }}"
+            version        = $version
+            owner          = "${{ inputs.owner }}"
+            packageUri     = $packageUri
+            packageType    = "zip"
+            executablePath = "${{ inputs.executable_path }}"
+            arguments      = "${{ inputs.arguments }}"
+            sha256         = $sha
+            helpTeamsUri   = "${{ inputs.help_teams_uri }}"
+            supportEmail   = "${{ inputs.support_email }}"
+          } | ConvertTo-Json -Depth 5
+
+          $manifest | Out-File -FilePath manifest.json -Encoding utf8NoBOM
+
+          az storage blob upload `
+            --account-name   "${{ vars.AZURE_STORAGE_ACCOUNT }}" `
+            --container-name "${{ vars.AZURE_STORAGE_CONTAINER }}" `
+            --name           "apps/$appId.json" `
+            --file           manifest.json `
+            --content-type   "application/json" `
+            --auth-mode      login `
+            --overwrite `
+            --output         none
+
+          Write-Host "Published apps/$appId.json (version $version, sha256 $sha)"
+
+      - name: Deployment summary
+        shell: pwsh
+        run: |
+          $version = "${{ steps.ver.outputs.version }}"
+          Add-Content $env:GITHUB_STEP_SUMMARY "## Deployment Summary"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- **Version**: $version"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- **Artifact**: $env:ARTIFACT_NAME"
+          Add-Content $env:GITHUB_STEP_SUMMARY "- **Commit**: ${{ github.sha }}"
