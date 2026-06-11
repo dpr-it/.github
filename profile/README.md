@@ -1,12 +1,25 @@
 ## Hi there 👋
 
-<!--
+## To Publish a applicaiton/microtool to the launcher:
 
-**Here are some ideas to get you started:**
+paste this into your repo's github actions
 
-🙋‍♀️ A short introduction - what is your organization all about?
-🌈 Contribution guidelines - how can the community get involved?
-👩‍💻 Useful resources - where can the community find your docs? Is there anything else the community should know?
-🍿 Fun facts - what does your team eat for breakfast?
-🧙 Remember, you can do mighty things with the power of [Markdown](https://docs.github.com/github/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax)
--->
+```yml
+name: Publish microtool
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    uses: dpr-it/.github/.github/workflows/publish-microtool.yml@main
+    with:
+      app_id: **my-tool-id**
+      app_name: **My Tool Name**
+      description: **What the tool does.**
+      executable_path: **My Tool Name.exe**
+      owner: **DPR VDC**
+      spec_file: my_tool.spec
+    secrets: inherit
+```
